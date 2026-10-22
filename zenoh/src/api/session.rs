@@ -162,7 +162,7 @@ impl fmt::Debug for LinkEventsListenerState {
 
 pub(crate) struct SessionState {
     pub(crate) primitives: Option<Arc<dyn Primitives>>, // @TODO replace with MaybeUninit ??
-    pub(crate) expr_id_counter: AtomicExprId,           // @TODO: manage rollover and uniqueness
+    pub(crate) expr_id_counter: AtomicExprId,
     pub(crate) qid_counter: AtomicRequestId,
     pub(crate) local_resources: IntHashMap<ExprId, LocalResource>,
     pub(crate) remote_resources: IntHashMap<ExprId, Resource>,
@@ -1502,13 +1502,21 @@ impl Session {
                 .iter_mut()
                 .find(|(_expr_id, res)| res.resource.name() == prefix)
             {
-                Some((expr_id, res)) if force || res.declared => {
+                Some((expr_id, res)) if res.count > 0 && (force || res.declared) => {
                     res.count += 1;
                     Ok(Some(*expr_id))
                 }
                 Some(_) => Ok(None),
                 None => {
-                    let expr_id = state.expr_id_counter.fetch_add(1, Ordering::SeqCst);
+                    // Check a full counter cycle, excluding the reserved ID and
+                    // resources that are still declared or being undeclared.
+                    let Some(expr_id) = (0..=ExprId::MAX)
+                        .map(|_| state.expr_id_counter.fetch_add(1, Ordering::SeqCst))
+                        .find(|id| *id != EMPTY_EXPR_ID && !state.local_resources.contains_key(id))
+                    else {
+                        // The caller can send the full key expression instead.
+                        return Ok(None);
+                    };
                     let mut res = Resource::new(Box::from(prefix));
                     if let Resource::Node(res_node) = &mut res {
                         for kind in [
@@ -1562,7 +1570,8 @@ impl Session {
         if let Some(entry) = state.local_resources.get_mut(&expr_id) {
             entry.count -= 1;
             if entry.count == 0 {
-                state.local_resources.remove(&expr_id);
+                // Keep the ID reserved until the routing layer has processed its
+                // undeclaration. A zero count also prevents sharing this prefix.
                 drop(state);
                 primitives.send_declare(&mut Declare {
                     interest_id: None,
@@ -1571,6 +1580,7 @@ impl Session {
                     ext_nodeid: declare::ext::NodeIdType::DEFAULT,
                     body: DeclareBody::UndeclareKeyExpr(UndeclareKeyExpr { id: expr_id }),
                 });
+                zwrite!(self.0.state).local_resources.remove(&expr_id);
             }
             Ok(())
         } else {
@@ -3759,5 +3769,203 @@ impl Closeable for Session {
 
     fn get_closee(&self) -> Self::TClosee {
         self.downgrade()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn sessions() -> (Session, Session) {
+        // Exercise the real routing primitives without starting network transports.
+        let runtime = RuntimeBuilder::new(Config::default())
+            .build()
+            .await
+            .unwrap();
+        let first = Session::init(runtime.clone().into(), vec![], vec![]).wait();
+        let second = Session::init(runtime.into(), vec![], vec![]).wait();
+        (first, second)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn prefix_id_rollover_preserves_live_subscribers() {
+        let (session, publisher) = sessions().await;
+        let victim = session.declare_subscriber("wrap/victim").wait().unwrap();
+        zwrite!(session.0.state)
+            .expr_id_counter
+            .store(ExprId::MAX, Ordering::SeqCst);
+        let last = session.declare_subscriber("wrap/last").wait().unwrap();
+        let zero = session.declare_subscriber("wrap/zero").wait().unwrap();
+        let probe = session.declare_subscriber("wrap/probe").wait().unwrap();
+
+        {
+            let state = zread!(session.0.state);
+            assert!(!state.local_resources.contains_key(&EMPTY_EXPR_ID));
+            assert_eq!(
+                state.local_resources.get(&1).unwrap().resource.name(),
+                "wrap/victim"
+            );
+            assert_eq!(
+                state
+                    .local_resources
+                    .get(&ExprId::MAX)
+                    .unwrap()
+                    .resource
+                    .name(),
+                "wrap/last"
+            );
+        }
+        for (key, subscriber) in [
+            ("wrap/victim", &victim),
+            ("wrap/last", &last),
+            ("wrap/zero", &zero),
+            ("wrap/probe", &probe),
+        ] {
+            publisher.put(key, key).wait().unwrap();
+            let sample = tokio::time::timeout(Duration::from_secs(5), subscriber.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sample.key_expr().as_str(), key);
+            assert_eq!(sample.payload().try_to_string().unwrap(), key);
+        }
+        for subscriber in [&victim, &last, &zero, &probe] {
+            assert!(subscriber.try_recv().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn prefix_id_exhaustion_uses_full_key_expression() {
+        let (session, publisher) = sessions().await;
+        {
+            let mut state = zwrite!(session.0.state);
+            // Populate the ID space directly to avoid 65,535 routing declarations.
+            for id in 1..=ExprId::MAX {
+                state.local_resources.insert(
+                    id,
+                    LocalResource {
+                        resource: Resource::new(format!("occupied/{id}").into()),
+                        declared: true,
+                        count: 1,
+                    },
+                );
+            }
+        }
+        let key_expr = session.declare_keyexpr("wrap/exhausted").wait().unwrap();
+        assert_eq!(key_expr.to_wire(&session).scope, EMPTY_EXPR_ID);
+        assert_eq!(key_expr.to_wire(&session).suffix, "wrap/exhausted");
+        assert_eq!(
+            zread!(session.0.state).local_resources.len(),
+            ExprId::MAX as usize
+        );
+
+        let subscriber = session.declare_subscriber(key_expr).wait().unwrap();
+        publisher.put("wrap/exhausted", "full key").wait().unwrap();
+        let sample = tokio::time::timeout(Duration::from_secs(5), subscriber.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.key_expr().as_str(), "wrap/exhausted");
+        assert_eq!(sample.payload().try_to_string().unwrap(), "full key");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn prefix_id_declaration_reuses_and_releases_resources() {
+        let (session, _publisher) = sessions().await;
+        assert_eq!(
+            session.declare_prefix("wrap/shared", false).wait().unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            session.declare_prefix("wrap/shared", false).wait().unwrap(),
+            Some(1)
+        );
+        session.undeclare_prefix(1).unwrap();
+        assert_eq!(
+            zread!(session.0.state)
+                .local_resources
+                .get(&1)
+                .unwrap()
+                .count,
+            1
+        );
+        session.undeclare_prefix(1).unwrap();
+        assert!(!zread!(session.0.state).local_resources.contains_key(&1));
+        zwrite!(session.0.state)
+            .expr_id_counter
+            .store(1, Ordering::SeqCst);
+        assert_eq!(
+            session.declare_prefix("wrap/reused", false).wait().unwrap(),
+            Some(1)
+        );
+    }
+
+    struct UndeclareHook {
+        inner: Arc<dyn Primitives>,
+        hook: Box<dyn Fn() + Send + Sync>,
+    }
+
+    impl Primitives for UndeclareHook {
+        fn send_interest(&self, msg: &mut Interest) {
+            self.inner.send_interest(msg);
+        }
+        fn send_declare(&self, msg: &mut Declare) {
+            if matches!(msg.body, DeclareBody::UndeclareKeyExpr(_)) {
+                (self.hook)();
+            }
+            self.inner.send_declare(msg);
+        }
+        fn send_push_consume(&self, msg: &mut Push, reliability: Reliability, consume: bool) {
+            self.inner.send_push_consume(msg, reliability, consume);
+        }
+        fn send_request(&self, msg: &mut Request) {
+            self.inner.send_request(msg);
+        }
+        fn send_response(&self, msg: &mut Response) {
+            self.inner.send_response(msg);
+        }
+        fn send_response_final(&self, msg: &mut ResponseFinal) {
+            self.inner.send_response_final(msg);
+        }
+        fn send_close(&self) {
+            self.inner.send_close();
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn prefix_id_stays_reserved_until_undeclaration_is_sent() {
+        let (session, _publisher) = sessions().await;
+        assert_eq!(
+            session.declare_prefix("wrap/old", false).wait().unwrap(),
+            Some(1)
+        );
+        let weak = session.downgrade();
+        let mut state = zwrite!(session.0.state);
+        state.expr_id_counter.store(1, Ordering::SeqCst);
+        let inner = state.primitives.take().unwrap();
+        state.primitives = Some(Arc::new(UndeclareHook {
+            inner,
+            // Reenter before the routing layer receives the undeclaration. This
+            // deterministically exercises the window available to other threads.
+            hook: Box::new(move || {
+                assert!(zread!(weak.0.state).local_resources.contains_key(&1));
+                assert_eq!(weak.declare_prefix("wrap/old", true).wait().unwrap(), None);
+                assert_eq!(
+                    weak.declare_prefix("wrap/new", false).wait().unwrap(),
+                    Some(2)
+                );
+            }),
+        }));
+        drop(state);
+        session.undeclare_prefix(1).unwrap();
+        let state = zread!(session.0.state);
+        assert!(!state.local_resources.contains_key(&1));
+        assert_eq!(
+            state.local_resources.get(&2).unwrap().resource.name(),
+            "wrap/new"
+        );
     }
 }
